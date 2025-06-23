@@ -122,6 +122,32 @@ mdoci.dumps()
 >> returns AF Binary mdoc string representation
 ````
 
+### Issue an MDOC CBOR with external sign request
+
+````
+from pymdoccbor.mdoc.issuer import MdocCborIssuer
+
+PID_DATA = {
+        "eu.europa.ec.eudiw.pid.1": {
+            "family_name": "Raffaello",
+            "given_name": "Mascetti",
+            "birth_date": "1922-03-13"
+        }
+    }
+
+mdoci = MdocCborIssuer(
+    alg="ES256",
+    signing_service_url="https://example.com/sign",
+)
+
+mdoc = mdoci.new(
+    doctype="eu.europa.ec.eudiw.pid.1",
+    data=PID_DATA,
+    validity={"issuance_date": "2025-01-17", "expiry_date": "2025-11-13"},
+)
+
+````
+
 ### Issue an MSO alone
 
 MsoIssuer is a class that handles private keys, data processing, digests and signature operations.
