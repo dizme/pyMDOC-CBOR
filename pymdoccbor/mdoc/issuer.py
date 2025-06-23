@@ -31,6 +31,7 @@ class MdocCborIssuer:
         alg: str = None,
         kid: str = None,
         private_key: Union[dict, CoseKey] = {},
+        signing_service_url: str = None,
     ):
         """
         Initialize a new MdocCborIssuer
@@ -43,6 +44,7 @@ class MdocCborIssuer:
         :param alg: str: hashig algorithm
         :param kid: str: key id
         :param private_key: Union[dict, CoseKey]: private key
+        :param signing_service_url: str: remote signing service endpoint
         """
         self.version: str = "1.0"
         self.status: int = 0
@@ -58,6 +60,8 @@ class MdocCborIssuer:
                 self.private_key = private_key
             else:
                 raise ValueError("private_key must be a dict or CoseKey object")
+        elif not hsm and not signing_service_url:
+            raise Exception("You must provide a private key")
 
         self.signed: dict = {}
         self.key_label = key_label
@@ -67,6 +71,7 @@ class MdocCborIssuer:
         self.hsm = hsm
         self.alg = alg
         self.kid = kid
+        self.signing_service_url = signing_service_url
 
     def new(
         self,
@@ -149,7 +154,8 @@ class MdocCborIssuer:
                 alg=self.alg,
                 kid=self.kid,
                 validity=validity,
-                revocation=revocation
+                revocation=revocation,
+                signing_service_url=self.signing_service_url
             )
 
         else:
@@ -159,19 +165,23 @@ class MdocCborIssuer:
                 alg=self.alg,
                 cert_path=cert_path,
                 validity=validity,
-                revocation=revocation
+                revocation=revocation,
+                signing_service_url=self.signing_service_url
             )
 
         mso = msoi.sign(doctype=doctype, device_key=devicekeyinfo,valid_from=datetime.now(timezone.utc))
 
-        mso_cbor = mso.encode(
-            tag=False,
-            hsm=self.hsm,
-            key_label=self.key_label,
-            user_pin=self.user_pin,
-            lib_path=self.lib_path,
-            slot_id=self.slot_id,
-        )
+        if self.hsm:
+            mso_cbor = mso.encode(
+                tag=False,
+                hsm=self.hsm,
+                key_label=self.key_label,
+                user_pin=self.user_pin,
+                lib_path=self.lib_path,
+                slot_id=self.slot_id,
+            )
+        else:
+            mso_cbor = mso.encode(tag=False)
 
 
         res = {
