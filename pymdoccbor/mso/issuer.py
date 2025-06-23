@@ -4,6 +4,9 @@ import hashlib
 import secrets
 import uuid
 import logging
+import base64
+import json
+from urllib import request as urlrequest
 
 logger = logging.getLogger("pymdoccbor")
 
@@ -44,7 +47,8 @@ class MsoIssuer(MsoX509Fabric):
         hsm: bool = False,
         private_key: Union[dict, CoseKey] = None,
         digest_alg: str = settings.PYMDOC_HASHALG,
-        revocation: dict = None
+        revocation: dict = None,
+        signing_service_url: str = None
     ) -> None:
         """
         Initialize a new MsoIssuer
@@ -60,11 +64,12 @@ class MsoIssuer(MsoX509Fabric):
         :param alg: str: hashig algorithm
         :param hsm: bool: hardware security module
         :param private_key: Union[dict, CoseKey]: the signing key
+        :param signing_service_url: str: remote signing service endpoint
         :param digest_alg: str: the digest algorithm
         :param revocation: dict: revocation status dict to include in the mso, it may include status_list and identifier_list keys
         """
 
-        if not hsm:
+        if not hsm and not signing_service_url:
             if private_key:
                 if isinstance(private_key, dict):
                     self.private_key = CoseKey.from_dict(private_key)
@@ -93,6 +98,7 @@ class MsoIssuer(MsoX509Fabric):
         self.lib_path = lib_path
         self.slot_id = slot_id
         self.hsm = hsm
+        self.signing_service_url = signing_service_url
         self.alg = alg
         self.kid = kid
         self.validity = validity
@@ -207,32 +213,35 @@ class MsoIssuer(MsoX509Fabric):
         if self.revocation is not None:
             payload.update({"status": self.revocation})
 
-        if self.cert_path:
-            # Try to load the certificate file
-            with open(self.cert_path, "rb") as file:
-                certificate = file.read()
-            _parsed_cert: Union[Certificate, None] = None
-            try:
-                _parsed_cert = x509.load_pem_x509_certificate(certificate)
-            except Exception as e:
-                logger.error(f"Certificate at {self.cert_path} could not be loaded as PEM, trying DER")
-            
-            if not _parsed_cert:
+        if not self.signing_service_url:
+            if self.cert_path:
+                # Try to load the certificate file
+                with open(self.cert_path, "rb") as file:
+                    certificate = file.read()
+                _parsed_cert: Union[Certificate, None] = None
                 try:
-                    _parsed_cert = x509.load_der_x509_certificate(certificate)
-                except Exception as e:
-                    _err_msg = f"Certificate at {self.cert_path} could not be loaded as DER"
-                    logger.error(_err_msg)
+                    _parsed_cert = x509.load_pem_x509_certificate(certificate)
+                except Exception:
+                    logger.error(f"Certificate at {self.cert_path} could not be loaded as PEM, trying DER")
 
-            if _parsed_cert:
-                cert = _parsed_cert
+                if not _parsed_cert:
+                    try:
+                        _parsed_cert = x509.load_der_x509_certificate(certificate)
+                    except Exception:
+                        _err_msg = f"Certificate at {self.cert_path} could not be loaded as DER"
+                        logger.error(_err_msg)
+
+                if _parsed_cert:
+                    cert = _parsed_cert
+                else:
+                    raise Exception(f"Certificate at {self.cert_path} failed parse")
+                _cert = cert.public_bytes(getattr(serialization.Encoding, "DER"))
             else:
-                raise Exception(f"Certificate at {self.cert_path} failed parse")
-            _cert = cert.public_bytes(getattr(serialization.Encoding, "DER"))
+                _cert = self.selfsigned_x509cert()
         else:
-            _cert = self.selfsigned_x509cert()
+            _cert = None
 
-        if self.hsm:
+        if self.hsm or self.signing_service_url:
             # print("payload diganostic notation: \n",cbor2diag(cbor2.dumps(cbor2.CBORTag(24, cbor2.dumps(payload)))))
 
             mso = Sign1Message(
@@ -243,13 +252,12 @@ class MsoIssuer(MsoX509Fabric):
                 # TODO: x509 (cbor2.CBORTag(33)) and federation trust_chain support (cbor2.CBORTag(27?)) here
                 # 33 means x509chain standing to rfc9360
                 # in both protected and unprotected for interop purpose .. for now.
-                uhdr={33: _cert},
+                uhdr={33: _cert} if _cert else {},
                 payload=cbor2.dumps(
                     cbor2.CBORTag(24, cbor2.dumps(payload, canonical=True)),
                     canonical=True,
                 ),
             )
-
         else:
             logger.debug("payload diagnostic notation: {cbor2diag(cbor2.dumps(cbor2.CBORTag(24,cbor2.dumps(payload))))}")
 
@@ -271,4 +279,39 @@ class MsoIssuer(MsoX509Fabric):
 
             mso.key = self.private_key
 
+        if self.signing_service_url:
+            mso = self._sign_with_external_service(mso)
+
         return mso
+
+    def _sign_with_external_service(self, message: Sign1Message) -> Sign1Message:
+        """Send bytes to be signed to an external service and attach results."""
+        protected = cbor2.dumps(message.phdr, canonical=True)
+        to_sign = cbor2.dumps([
+            "Signature1",
+            protected,
+            b"",
+            message.payload,
+        ], canonical=True)
+
+        req_body = json.dumps({"tbs": base64.b64encode(to_sign).decode()}).encode()
+        req = urlrequest.Request(
+            self.signing_service_url,
+            data=req_body,
+            headers={"Content-Type": "application/json"},
+        )
+
+        with urlrequest.urlopen(req) as resp:
+            resp_data = json.loads(resp.read())
+
+        signature = base64.b64decode(resp_data["signature"])
+        chain = resp_data.get("chain", [])
+        certs = []
+        for pem in chain:
+            cert = x509.load_pem_x509_certificate(pem.encode())
+            certs.append(cert.public_bytes(serialization.Encoding.DER))
+
+        if certs:
+            message.uhdr[33] = certs
+        message.signature = signature
+        return message
